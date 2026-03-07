@@ -5,7 +5,6 @@ import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
-import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
 from tastytrade import Account, Session
@@ -134,9 +133,17 @@ def record_rebalance(longs, shorts):
 # --- Universe ---
 
 def get_sp500_tickers():
-    table = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-    tickers = table["Symbol"].str.replace(".", "-", regex=False).tolist()
-    log.info(f"Fetched {len(tickers)} S&P 500 tickers")
+    """Top 500 US equities by market cap via yfinance screener (S&P 500 proxy)."""
+    query = yf.EquityQuery("and", [
+        yf.EquityQuery("eq", ["region", "us"]),
+        yf.EquityQuery("is-in", ["exchange", "NMS", "NYQ"]),
+        yf.EquityQuery("gte", ["intradaymarketcap", 2_000_000_000]),
+    ])
+    tickers = []
+    for offset in range(0, 500, 250):
+        result = yf.screen(query, sortField="intradaymarketcap", sortAsc=False, size=250, offset=offset)
+        tickers.extend(q["symbol"] for q in result.get("quotes", []))
+    log.info(f"Fetched {len(tickers)} large-cap US tickers via yfinance screener")
     return tickers
 
 
@@ -441,10 +448,14 @@ def is_rebalance_window():
     today = date.today()
     if today.weekday() >= 5:  # skip weekends
         return False
-    first = today.replace(day=1)
-    bdays = pd.bdate_range(first, today)
-    bday_of_month = len(bdays)
-    return REBALANCE_DAY_RANGE[0] <= bday_of_month <= REBALANCE_DAY_RANGE[1]
+    # count business days from 1st of month to today
+    bday_count = 0
+    d = today.replace(day=1)
+    while d <= today:
+        if d.weekday() < 5:
+            bday_count += 1
+        d += timedelta(days=1)
+    return REBALANCE_DAY_RANGE[0] <= bday_count <= REBALANCE_DAY_RANGE[1]
 
 
 async def rebalance():
