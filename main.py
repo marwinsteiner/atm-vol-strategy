@@ -2,16 +2,15 @@ import asyncio
 import logging
 import os
 import sqlite3
-import time
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-import numpy as np
 import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
 from tastytrade import Account, Session
 from tastytrade.instruments import NestedOptionChain
+from tastytrade.market_data import get_market_data_by_type
 from tastytrade.metrics import get_market_metrics
 from tastytrade.order import (
     InstrumentType,
@@ -42,6 +41,8 @@ CONTRACTS_PER_TRADE = 1
 REBALANCE_DAY_RANGE = (5, 8)  # business days 5-8 of the month
 SCAN_BATCH_SIZE = 20  # how many symbols to scan at once via tastytrade metrics
 LOOP_INTERVAL_HOURS = 1
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+TT_ACCOUNT = os.getenv("TT_ACCOUNT", "")
 
 # --- Database ---
 
@@ -289,6 +290,20 @@ def pick_spread_strikes(strikes, price, direction):
         return atm, otm
 
 
+async def get_spread_mid_price(session, buy_sym, sell_sym):
+    """Get the net debit mid-price for a vertical spread."""
+    try:
+        data = await get_market_data_by_type(session, options=[buy_sym, sell_sym])
+        by_sym = {d.symbol: d for d in data}
+        buy_md = by_sym.get(buy_sym)
+        sell_md = by_sym.get(sell_sym)
+        if buy_md and sell_md and buy_md.mid and sell_md.mid:
+            return abs(buy_md.mid - sell_md.mid)
+    except Exception as e:
+        log.debug(f"Mid-price fetch failed: {e}")
+    return None
+
+
 async def close_all_positions(session, account):
     open_pos = get_open_positions()
     if not open_pos:
@@ -314,19 +329,37 @@ async def close_all_positions(session, account):
                     quantity=pos["quantity"],
                 ))
 
-        if legs:
-            order = NewOrder(
-                time_in_force=OrderTimeInForce.DAY,
-                order_type=OrderType.MARKET,
-                legs=legs,
-            )
-            try:
-                resp = await account.place_order(session, order, dry_run=False)
-                log.info(f"Closed {pos['ticker']} {pos['direction']}: order {resp}")
-            except Exception as e:
-                log.error(f"Failed to close {pos['ticker']}: {e}")
+        if not legs:
+            mark_position_closed(pos["id"])
+            continue
+
+        order = NewOrder(
+            time_in_force=OrderTimeInForce.DAY,
+            order_type=OrderType.MARKET,
+            legs=legs,
+        )
+        try:
+            resp = await account.place_order(session, order, dry_run=DRY_RUN)
+            log.info(f"{'[DRY] ' if DRY_RUN else ''}Closed {pos['ticker']} {pos['direction']}: {resp}")
+        except Exception as e:
+            log.error(f"Failed to close {pos['ticker']}: {e}")
 
         mark_position_closed(pos["id"])
+
+
+async def get_stock_price(session, ticker):
+    """Get current stock price via tastytrade market data, yfinance fallback."""
+    try:
+        data = await get_market_data_by_type(session, equities=[ticker])
+        if data and data[0].mark:
+            return float(data[0].mark)
+    except Exception:
+        pass
+    try:
+        info = yf.Ticker(ticker).info
+        return float(info.get("regularMarketPrice") or info.get("currentPrice") or 0)
+    except Exception:
+        return 0.0
 
 
 async def open_vertical_spread(session, account, ticker, direction):
@@ -342,12 +375,7 @@ async def open_vertical_spread(session, account, ticker, direction):
         if not strikes:
             return
 
-        # get current price from market data
-        metrics = await get_market_metrics(session, [ticker])
-        if not metrics:
-            return
-        # use the mark or last price from yfinance as fallback
-        price = float(yf.Ticker(ticker).info.get("regularMarketPrice", 0))
+        price = await get_stock_price(session, ticker)
         if price <= 0:
             return
 
@@ -356,7 +384,6 @@ async def open_vertical_spread(session, account, ticker, direction):
             log.warning(f"Could not find spread strikes for {ticker}")
             return
 
-        # find the OCC symbols from the strikes list
         strike_map = {s.strike_price: s for s in strikes}
         atm_s = strike_map.get(atm_strike)
         otm_s = strike_map.get(otm_strike)
@@ -364,11 +391,9 @@ async def open_vertical_spread(session, account, ticker, direction):
             return
 
         if direction == "long":
-            # bull call spread: buy ATM call, sell OTM call
             buy_sym = atm_s.call
             sell_sym = otm_s.call
         else:
-            # bear put spread: buy ATM put, sell OTM put
             buy_sym = atm_s.put
             sell_sym = otm_s.put
 
@@ -387,15 +412,31 @@ async def open_vertical_spread(session, account, ticker, direction):
             ),
         ]
 
-        order = NewOrder(
-            time_in_force=OrderTimeInForce.DAY,
-            order_type=OrderType.MARKET,
-            legs=legs,
-        )
+        # try limit at mid-price, fall back to market
+        mid = await get_spread_mid_price(session, buy_sym, sell_sym)
+        if mid and mid > 0:
+            order = NewOrder(
+                time_in_force=OrderTimeInForce.DAY,
+                order_type=OrderType.LIMIT,
+                price=Decimal(str(round(float(mid), 2))),
+                price_effect=PriceEffect.DEBIT,
+                legs=legs,
+            )
+        else:
+            order = NewOrder(
+                time_in_force=OrderTimeInForce.DAY,
+                order_type=OrderType.MARKET,
+                legs=legs,
+            )
 
-        resp = await account.place_order(session, order, dry_run=False)
-        log.info(f"Opened {direction} spread on {ticker}: {buy_sym}/{sell_sym} -> {resp}")
-        record_position(ticker, direction, buy_sym, sell_sym, CONTRACTS_PER_TRADE)
+        resp = await account.place_order(session, order, dry_run=DRY_RUN)
+        log.info(
+            f"{'[DRY] ' if DRY_RUN else ''}Opened {direction} spread on {ticker}: "
+            f"{buy_sym}/{sell_sym} @ {exp.expiration_date} "
+            f"strikes {atm_strike}/{otm_strike}"
+        )
+        if not DRY_RUN:
+            record_position(ticker, direction, buy_sym, sell_sym, CONTRACTS_PER_TRADE)
 
     except Exception as e:
         log.error(f"Failed to open spread for {ticker}: {e}")
@@ -429,12 +470,15 @@ async def rebalance():
     # 2. connect to tastytrade
     session = Session()
     async with session:
-        accounts = await Account.get(session)
-        if not accounts:
-            log.error("No tastytrade accounts found")
-            return
-        account = accounts[0]
-        log.info(f"Using account {account.account_number}")
+        if TT_ACCOUNT:
+            account = await Account.get(session, TT_ACCOUNT)
+        else:
+            accounts = await Account.get(session)
+            if not accounts:
+                log.error("No tastytrade accounts found")
+                return
+            account = accounts[0]
+        log.info(f"Using account {account.account_number} (dry_run={DRY_RUN})")
 
         # 3. filter dividend payers via tastytrade metrics
         universe = await filter_no_dividends_tt(session, tickers)
