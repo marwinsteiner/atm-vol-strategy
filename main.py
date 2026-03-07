@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pandas as pd
@@ -88,7 +88,7 @@ def record_position(ticker, direction, long_sym, short_sym, qty):
     con = sqlite3.connect(DB_PATH)
     con.execute(
         "INSERT INTO positions (ticker, direction, long_symbol, short_symbol, quantity, opened_at) VALUES (?,?,?,?,?,?)",
-        (ticker, direction, long_sym, short_sym, qty, datetime.utcnow().isoformat()),
+        (ticker, direction, long_sym, short_sym, qty, datetime.now(timezone.utc).isoformat()),
     )
     con.commit()
     con.close()
@@ -98,7 +98,7 @@ def mark_position_closed(position_id):
     con = sqlite3.connect(DB_PATH)
     con.execute(
         "UPDATE positions SET closed_at = ? WHERE id = ?",
-        (datetime.utcnow().isoformat(), position_id),
+        (datetime.now(timezone.utc).isoformat(), position_id),
     )
     con.commit()
     con.close()
@@ -124,7 +124,7 @@ def record_rebalance(longs, shorts):
             date.today().isoformat(),
             ",".join(longs),
             ",".join(shorts),
-            datetime.utcnow().isoformat(),
+            datetime.now(timezone.utc).isoformat(),
         ),
     )
     con.commit()
@@ -138,20 +138,6 @@ def get_sp500_tickers():
     tickers = table["Symbol"].str.replace(".", "-", regex=False).tolist()
     log.info(f"Fetched {len(tickers)} S&P 500 tickers")
     return tickers
-
-
-def filter_no_dividends_yf(tickers):
-    clean = []
-    for t in tickers:
-        try:
-            info = yf.Ticker(t).info
-            div_yield = info.get("dividendYield") or 0
-            if div_yield == 0:
-                clean.append(t)
-        except Exception:
-            pass
-    log.info(f"{len(clean)} tickers after removing dividend payers (yfinance)")
-    return clean
 
 
 async def filter_no_dividends_tt(session, tickers):
@@ -248,14 +234,21 @@ def get_momentum_signal(ticker, lookback=252, skip=21):
 
 def generate_signals(universe):
     longs, shorts = [], []
-    for ticker in universe:
+    total = len(universe)
+    for i, ticker in enumerate(universe):
+        if (i + 1) % 50 == 0:
+            log.info(f"Scanning signals: {i + 1}/{total}")
         iv = get_iv_signal_yf(ticker)
+        if iv == 0:
+            continue
         mom = get_momentum_signal(ticker)
         if iv == 1 and mom == 1:
             longs.append(ticker)
+            log.info(f"  LONG signal: {ticker} (iv={iv}, mom={mom})")
         elif iv == -1 and mom == -1:
             shorts.append(ticker)
-    log.info(f"Signals: {len(longs)} long, {len(shorts)} short")
+            log.info(f"  SHORT signal: {ticker} (iv={iv}, mom={mom})")
+    log.info(f"Signals complete: {len(longs)} long, {len(shorts)} short")
     return longs[:MAX_POSITIONS // 2], shorts[:MAX_POSITIONS // 2]
 
 
