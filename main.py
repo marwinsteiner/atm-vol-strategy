@@ -42,6 +42,8 @@ SCAN_BATCH_SIZE = 20  # how many symbols to scan at once via tastytrade metrics
 LOOP_INTERVAL_HOURS = 1
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 TT_ACCOUNT = os.getenv("TT_ACCOUNT", "")
+PAPER_MODE = os.getenv("PAPER_MODE", "false").lower() == "true"
+COMMISSION_PER_CONTRACT = 1.00  # per leg per contract
 
 # --- Database ---
 
@@ -55,6 +57,9 @@ def init_db():
             long_symbol TEXT NOT NULL,
             short_symbol TEXT NOT NULL,
             quantity INTEGER NOT NULL,
+            entry_debit REAL,
+            exit_credit REAL,
+            commissions REAL,
             opened_at TEXT NOT NULL,
             closed_at TEXT
         )
@@ -68,36 +73,48 @@ def init_db():
             completed_at TEXT
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS monthly_pnl (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            month TEXT NOT NULL UNIQUE,
+            gross_pnl REAL NOT NULL,
+            commissions REAL NOT NULL,
+            net_pnl REAL NOT NULL,
+            num_trades INTEGER NOT NULL,
+            cumulative_pnl REAL NOT NULL
+        )
+    """)
     con.commit()
     con.close()
 
 
 def get_open_positions():
     con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
     rows = con.execute(
         "SELECT * FROM positions WHERE closed_at IS NULL"
     ).fetchall()
     con.close()
-    cols = ["id", "ticker", "direction", "long_symbol", "short_symbol",
-            "quantity", "opened_at", "closed_at"]
-    return [dict(zip(cols, r)) for r in rows]
+    return [dict(r) for r in rows]
 
 
-def record_position(ticker, direction, long_sym, short_sym, qty):
+def record_position(ticker, direction, long_sym, short_sym, qty, entry_debit=None):
+    comms = qty * 2 * COMMISSION_PER_CONTRACT  # 2 legs
     con = sqlite3.connect(DB_PATH)
     con.execute(
-        "INSERT INTO positions (ticker, direction, long_symbol, short_symbol, quantity, opened_at) VALUES (?,?,?,?,?,?)",
-        (ticker, direction, long_sym, short_sym, qty, datetime.now(timezone.utc).isoformat()),
+        "INSERT INTO positions (ticker, direction, long_symbol, short_symbol, quantity, entry_debit, commissions, opened_at) VALUES (?,?,?,?,?,?,?,?)",
+        (ticker, direction, long_sym, short_sym, qty, entry_debit, comms, datetime.now(timezone.utc).isoformat()),
     )
     con.commit()
     con.close()
 
 
-def mark_position_closed(position_id):
+def mark_position_closed(position_id, exit_credit=None):
+    close_comms = COMMISSION_PER_CONTRACT * 2  # 2 legs to close
     con = sqlite3.connect(DB_PATH)
     con.execute(
-        "UPDATE positions SET closed_at = ? WHERE id = ?",
-        (datetime.now(timezone.utc).isoformat(), position_id),
+        "UPDATE positions SET closed_at = ?, exit_credit = ?, commissions = commissions + ? WHERE id = ?",
+        (datetime.now(timezone.utc).isoformat(), exit_credit, close_comms, position_id),
     )
     con.commit()
     con.close()
@@ -310,41 +327,48 @@ async def close_all_positions(session, account):
         log.info("No open positions to close")
         return
 
-    broker_positions = await account.get_positions(
-        session, instrument_type=InstrumentType.EQUITY_OPTION
-    )
-    broker_syms = {p.symbol: p for p in broker_positions if p.quantity != 0}
-
     for pos in open_pos:
-        legs = []
-        for sym, action in [
-            (pos["long_symbol"], OrderAction.SELL_TO_CLOSE),
-            (pos["short_symbol"], OrderAction.BUY_TO_CLOSE),
-        ]:
-            if sym in broker_syms:
-                legs.append(Leg(
-                    instrument_type=InstrumentType.EQUITY_OPTION,
-                    symbol=sym,
-                    action=action,
-                    quantity=pos["quantity"],
-                ))
+        buy_sym, sell_sym = pos["long_symbol"], pos["short_symbol"]
+        exit_credit = await get_spread_mid_price(session, buy_sym, sell_sym)
+        exit_val = float(exit_credit) if exit_credit else None
 
-        if not legs:
-            mark_position_closed(pos["id"])
-            continue
+        if not PAPER_MODE:
+            broker_positions = await account.get_positions(
+                session, instrument_type=InstrumentType.EQUITY_OPTION
+            )
+            broker_syms = {p.symbol: p for p in broker_positions if p.quantity != 0}
 
-        order = NewOrder(
-            time_in_force=OrderTimeInForce.DAY,
-            order_type=OrderType.MARKET,
-            legs=legs,
+            legs = []
+            for sym, action in [
+                (buy_sym, OrderAction.SELL_TO_CLOSE),
+                (sell_sym, OrderAction.BUY_TO_CLOSE),
+            ]:
+                if sym in broker_syms:
+                    legs.append(Leg(
+                        instrument_type=InstrumentType.EQUITY_OPTION,
+                        symbol=sym,
+                        action=action,
+                        quantity=pos["quantity"],
+                    ))
+
+            if legs:
+                order = NewOrder(
+                    time_in_force=OrderTimeInForce.DAY,
+                    order_type=OrderType.MARKET,
+                    legs=legs,
+                )
+                try:
+                    resp = await account.place_order(session, order, dry_run=DRY_RUN)
+                    log.info(f"{'[DRY] ' if DRY_RUN else ''}Closed {pos['ticker']} {pos['direction']}: {resp}")
+                except Exception as e:
+                    log.error(f"Failed to close {pos['ticker']}: {e}")
+
+        tag = "[PAPER] " if PAPER_MODE else ""
+        log.info(
+            f"{tag}Closed {pos['ticker']} {pos['direction']}: "
+            f"entry={pos['entry_debit']} exit={exit_val}"
         )
-        try:
-            resp = await account.place_order(session, order, dry_run=DRY_RUN)
-            log.info(f"{'[DRY] ' if DRY_RUN else ''}Closed {pos['ticker']} {pos['direction']}: {resp}")
-        except Exception as e:
-            log.error(f"Failed to close {pos['ticker']}: {e}")
-
-        mark_position_closed(pos["id"])
+        mark_position_closed(pos["id"], exit_credit=exit_val)
 
 
 async def get_stock_price(session, ticker):
@@ -397,6 +421,21 @@ async def open_vertical_spread(session, account, ticker, direction):
             buy_sym = atm_s.put
             sell_sym = otm_s.put
 
+        mid = await get_spread_mid_price(session, buy_sym, sell_sym)
+        entry = float(mid) if mid else None
+
+        if PAPER_MODE:
+            if entry is None:
+                log.warning(f"No mid-price for {ticker}, skipping paper fill")
+                return
+            record_position(ticker, direction, buy_sym, sell_sym, CONTRACTS_PER_TRADE, entry_debit=entry)
+            log.info(
+                f"[PAPER] Filled {direction} spread on {ticker}: "
+                f"{buy_sym}/{sell_sym} @ {exp.expiration_date} "
+                f"strikes {atm_strike}/{otm_strike} debit={entry:.4f}"
+            )
+            return
+
         legs = [
             Leg(
                 instrument_type=InstrumentType.EQUITY_OPTION,
@@ -412,8 +451,6 @@ async def open_vertical_spread(session, account, ticker, direction):
             ),
         ]
 
-        # try limit at mid-price, fall back to market
-        mid = await get_spread_mid_price(session, buy_sym, sell_sym)
         if mid and mid > 0:
             order = NewOrder(
                 time_in_force=OrderTimeInForce.DAY,
@@ -436,10 +473,74 @@ async def open_vertical_spread(session, account, ticker, direction):
             f"strikes {atm_strike}/{otm_strike}"
         )
         if not DRY_RUN:
-            record_position(ticker, direction, buy_sym, sell_sym, CONTRACTS_PER_TRADE)
+            record_position(ticker, direction, buy_sym, sell_sym, CONTRACTS_PER_TRADE, entry_debit=entry)
 
     except Exception as e:
         log.error(f"Failed to open spread for {ticker}: {e}")
+
+
+# --- P&L Tracking ---
+
+def compute_monthly_pnl():
+    """Compute and store P&L for positions closed this month."""
+    con = sqlite3.connect(DB_PATH)
+    today = date.today()
+    month_str = today.strftime("%Y-%m")
+    first_of_month = today.replace(day=1).isoformat()
+
+    rows = con.execute(
+        "SELECT entry_debit, exit_credit, commissions, quantity FROM positions WHERE closed_at >= ?",
+        (first_of_month,),
+    ).fetchall()
+
+    if not rows:
+        con.close()
+        return
+
+    gross_pnl = 0.0
+    total_comms = 0.0
+    for entry_debit, exit_credit, comms, qty in rows:
+        if entry_debit is not None and exit_credit is not None:
+            # P&L = (exit - entry) * 100 * qty for options
+            gross_pnl += (exit_credit - entry_debit) * 100 * qty
+        total_comms += comms or 0
+
+    net_pnl = gross_pnl - total_comms
+
+    # get cumulative
+    prev = con.execute(
+        "SELECT cumulative_pnl FROM monthly_pnl ORDER BY month DESC LIMIT 1"
+    ).fetchone()
+    cum = (prev[0] if prev else 0.0) + net_pnl
+
+    con.execute(
+        "INSERT OR REPLACE INTO monthly_pnl (month, gross_pnl, commissions, net_pnl, num_trades, cumulative_pnl) VALUES (?,?,?,?,?,?)",
+        (month_str, round(gross_pnl, 2), round(total_comms, 2), round(net_pnl, 2), len(rows), round(cum, 2)),
+    )
+    con.commit()
+    con.close()
+
+    log.info(
+        f"Monthly P&L [{month_str}]: gross=${gross_pnl:+.2f} comms=${total_comms:.2f} "
+        f"net=${net_pnl:+.2f} trades={len(rows)} cumulative=${cum:+.2f}"
+    )
+
+
+def print_paper_summary():
+    """Print full walk-forward results."""
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute("SELECT * FROM monthly_pnl ORDER BY month").fetchall()
+    con.close()
+    if not rows:
+        log.info("No paper results yet")
+        return
+    log.info("=" * 70)
+    log.info(f"{'Month':<10} {'Gross':>10} {'Comms':>10} {'Net':>10} {'Trades':>7} {'Cumulative':>12}")
+    log.info("-" * 70)
+    for row in rows:
+        _, month, gross, comms, net, trades, cum = row
+        log.info(f"{month:<10} {gross:>+10.2f} {comms:>10.2f} {net:>+10.2f} {trades:>7} {cum:>+12.2f}")
+    log.info("=" * 70)
 
 
 # --- Rebalance Logic ---
@@ -466,7 +567,8 @@ async def rebalance():
         log.info("Not in rebalance window")
         return
 
-    log.info("=== REBALANCE START ===")
+    tag = "[PAPER] " if PAPER_MODE else ""
+    log.info(f"=== {tag}REBALANCE START ===")
 
     # 1. get universe
     tickers = get_sp500_tickers()
@@ -482,7 +584,7 @@ async def rebalance():
                 log.error("No tastytrade accounts found")
                 return
             account = accounts[0]
-        log.info(f"Using account {account.account_number} (dry_run={DRY_RUN})")
+        log.info(f"Using account {account.account_number} (paper={PAPER_MODE}, dry_run={DRY_RUN})")
 
         # 3. filter dividend payers via tastytrade metrics
         universe = await filter_no_dividends_tt(session, tickers)
@@ -491,24 +593,33 @@ async def rebalance():
         longs, shorts = generate_signals(universe)
         log.info(f"Final targets: LONG {longs}, SHORT {shorts}")
 
-        # 5. close existing positions
+        # 5. close existing positions (paper: mark-to-market at TT mid)
+        had_positions = bool(get_open_positions())
         await close_all_positions(session, account)
 
-        # 6. open new positions
+        if PAPER_MODE and had_positions:
+            compute_monthly_pnl()
+
+        # 6. open new positions (paper: record fill at TT mid)
         for ticker in longs:
             await open_vertical_spread(session, account, ticker, "long")
         for ticker in shorts:
             await open_vertical_spread(session, account, ticker, "short")
 
         record_rebalance(longs, shorts)
-        log.info("=== REBALANCE COMPLETE ===")
+
+        if PAPER_MODE:
+            print_paper_summary()
+
+        log.info(f"=== {tag}REBALANCE COMPLETE ===")
 
 
 # --- Main Loop ---
 
 async def main_loop():
     init_db()
-    log.info("Strategy process started")
+    mode = "PAPER" if PAPER_MODE else ("DRY-RUN" if DRY_RUN else "LIVE")
+    log.info(f"Strategy process started (mode={mode})")
 
     while True:
         try:
