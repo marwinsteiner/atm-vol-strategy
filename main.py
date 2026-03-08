@@ -7,7 +7,8 @@ from decimal import Decimal
 
 import yfinance as yf
 from dotenv import load_dotenv
-from tastytrade import Account, Session
+from tastytrade import Account, DXLinkStreamer, Session
+from tastytrade.dxfeed import Greeks
 from tastytrade.instruments import NestedOptionChain
 from tastytrade.market_data import get_market_data_by_type
 from tastytrade.metrics import get_market_metrics
@@ -47,8 +48,59 @@ COMMISSION_PER_CONTRACT = 1.00  # per leg per contract
 
 # --- Database ---
 
-def init_db():
+
+def get_db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA foreign_keys=ON")
+    return con
+
+
+def migrate_db(con):
+    """Migrate old rebalances schema to new schema with status tracking."""
+    cols = con.execute("PRAGMA table_info(rebalances)").fetchall()
+    if not cols:
+        return  # table doesn't exist yet, will be created fresh
+    col_names = [c["name"] for c in cols]
+    if "status" in col_names:
+        return  # already migrated
+
+    log.info("Migrating rebalances table to new schema...")
+    con.execute("ALTER TABLE rebalances RENAME TO rebalances_old")
+    con.execute("""
+        CREATE TABLE rebalances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rebalance_date TEXT NOT NULL,
+            month TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            tickers_long TEXT,
+            tickers_short TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+    """)
+    con.execute("""
+        INSERT INTO rebalances (rebalance_date, month, status, tickers_long, tickers_short,
+                                created_at, updated_at, completed_at)
+        SELECT rebalance_date,
+               substr(rebalance_date, 1, 7),
+               'COMPLETED',
+               tickers_long, tickers_short,
+               COALESCE(completed_at, rebalance_date || 'T00:00:00+00:00'),
+               COALESCE(completed_at, rebalance_date || 'T00:00:00+00:00'),
+               completed_at
+        FROM rebalances_old
+    """)
+    con.execute("DROP TABLE rebalances_old")
+    con.commit()
+    log.info("Migration complete")
+
+
+def init_db():
+    con = get_db()
+    migrate_db(con)
     con.execute("""
         CREATE TABLE IF NOT EXISTS positions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,10 +119,27 @@ def init_db():
     con.execute("""
         CREATE TABLE IF NOT EXISTS rebalances (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            rebalance_date TEXT NOT NULL UNIQUE,
+            rebalance_date TEXT NOT NULL,
+            month TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'PENDING',
             tickers_long TEXT,
             tickers_short TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
             completed_at TEXT
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS rebalance_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rebalance_id INTEGER NOT NULL REFERENCES rebalances(id),
+            ticker TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            direction TEXT,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            position_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         )
     """)
     con.execute("""
@@ -88,66 +157,151 @@ def init_db():
     con.close()
 
 
-def get_open_positions():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    rows = con.execute(
+def get_open_positions(con=None):
+    db = con or get_db()
+    rows = db.execute(
         "SELECT * FROM positions WHERE closed_at IS NULL"
     ).fetchall()
-    con.close()
+    if not con:
+        db.close()
     return [dict(r) for r in rows]
 
 
-def record_position(ticker, direction, long_sym, short_sym, qty, entry_debit=None):
+def record_position(ticker, direction, long_sym, short_sym, qty, entry_debit=None, con=None):
     comms = qty * 2 * COMMISSION_PER_CONTRACT  # 2 legs
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        "INSERT INTO positions (ticker, direction, long_symbol, short_symbol, quantity, entry_debit, commissions, opened_at) VALUES (?,?,?,?,?,?,?,?)",
-        (ticker, direction, long_sym, short_sym, qty, entry_debit, comms, datetime.now(timezone.utc).isoformat()),
+    db = con or get_db()
+    cur = db.execute(
+        "INSERT INTO positions (ticker, direction, long_symbol, short_symbol, "
+        "quantity, entry_debit, commissions, opened_at) VALUES (?,?,?,?,?,?,?,?)",
+        (ticker, direction, long_sym, short_sym, qty, entry_debit, comms,
+         datetime.now(timezone.utc).isoformat()),
     )
-    con.commit()
-    con.close()
+    if not con:
+        db.commit()
+        db.close()
+    return cur.lastrowid
 
 
-def mark_position_closed(position_id, exit_credit=None):
+def mark_position_closed(position_id, exit_credit=None, con=None):
     close_comms = COMMISSION_PER_CONTRACT * 2  # 2 legs to close
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
+    db = con or get_db()
+    db.execute(
         "UPDATE positions SET closed_at = ?, exit_credit = ?, commissions = commissions + ? WHERE id = ?",
         (datetime.now(timezone.utc).isoformat(), exit_credit, close_comms, position_id),
     )
-    con.commit()
-    con.close()
+    if not con:
+        db.commit()
+        db.close()
 
 
 def was_rebalanced_this_month():
-    con = sqlite3.connect(DB_PATH)
-    today = date.today()
-    first_of_month = today.replace(day=1).isoformat()
+    con = get_db()
+    month_str = date.today().strftime("%Y-%m")
     row = con.execute(
-        "SELECT 1 FROM rebalances WHERE rebalance_date >= ? LIMIT 1",
-        (first_of_month,),
+        "SELECT 1 FROM rebalances WHERE month = ? AND status = 'COMPLETED' LIMIT 1",
+        (month_str,),
     ).fetchone()
     con.close()
     return row is not None
 
 
-def record_rebalance(longs, shorts):
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        "INSERT OR IGNORE INTO rebalances (rebalance_date, tickers_long, tickers_short, completed_at) VALUES (?,?,?,?)",
-        (
-            date.today().isoformat(),
-            ",".join(longs),
-            ",".join(shorts),
-            datetime.now(timezone.utc).isoformat(),
-        ),
+def create_rebalance_record(longs, shorts):
+    con = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    month_str = date.today().strftime("%Y-%m")
+    cur = con.execute(
+        "INSERT INTO rebalances (rebalance_date, month, status, tickers_long, "
+        "tickers_short, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+        (date.today().isoformat(), month_str, "PENDING",
+         ",".join(longs), ",".join(shorts), now, now),
     )
     con.commit()
+    rb_id = cur.lastrowid
     con.close()
+    return rb_id
+
+
+def update_rebalance_status(rb_id, status, con=None):
+    db = con or get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    if status == "COMPLETED":
+        db.execute(
+            "UPDATE rebalances SET status = ?, updated_at = ?, completed_at = ? WHERE id = ?",
+            (status, now, now, rb_id),
+        )
+    else:
+        db.execute(
+            "UPDATE rebalances SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now, rb_id),
+        )
+    if not con:
+        db.commit()
+        db.close()
+
+
+def plan_close_items(rb_id, open_positions, con=None):
+    db = con or get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    for pos in open_positions:
+        db.execute(
+            "INSERT INTO rebalance_items (rebalance_id, ticker, operation, direction, "
+            "status, position_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (rb_id, pos["ticker"], "CLOSE", pos["direction"], "PENDING",
+             pos["id"], now, now),
+        )
+    if not con:
+        db.commit()
+        db.close()
+
+
+def plan_open_items(rb_id, longs, shorts, con=None):
+    db = con or get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    for ticker in longs:
+        db.execute(
+            "INSERT INTO rebalance_items (rebalance_id, ticker, operation, direction, "
+            "status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (rb_id, ticker, "OPEN", "long", "PENDING", now, now),
+        )
+    for ticker in shorts:
+        db.execute(
+            "INSERT INTO rebalance_items (rebalance_id, ticker, operation, direction, "
+            "status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (rb_id, ticker, "OPEN", "short", "PENDING", now, now),
+        )
+    if not con:
+        db.commit()
+        db.close()
+
+
+def get_pending_rebalance():
+    con = get_db()
+    month_str = date.today().strftime("%Y-%m")
+    row = con.execute(
+        "SELECT * FROM rebalances WHERE month = ? AND status != 'COMPLETED' LIMIT 1",
+        (month_str,),
+    ).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def get_rebalance_items(rb_id, operation=None, status=None):
+    con = get_db()
+    query = "SELECT * FROM rebalance_items WHERE rebalance_id = ?"
+    params = [rb_id]
+    if operation:
+        query += " AND operation = ?"
+        params.append(operation)
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    rows = con.execute(query, params).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
 
 
 # --- Universe ---
+
 
 def get_sp500_tickers():
     """Top 500 US equities by market cap via yfinance screener (S&P 500 proxy)."""
@@ -181,62 +335,113 @@ async def filter_no_dividends_tt(session, tickers):
 
 # --- Signals ---
 
-def get_iv_signal_yf(ticker):
-    """Check ATM call IV vs put IV at 30/60/90 DTE using yfinance.
-    Returns 1 (long), -1 (short), or 0 (no signal).
+
+async def gather_iv_symbols(session, universe):
+    """Get ATM streamer symbols for each ticker at each DTE target.
+
+    Returns (symbol_map, all_symbols) where symbol_map is
+    {ticker: {dte: (call_streamer_sym, put_streamer_sym)}}
+    and all_symbols is the flat set of all streamer symbols to subscribe to.
     """
-    try:
-        tk = yf.Ticker(ticker)
-        price = tk.info.get("regularMarketPrice") or tk.info.get("currentPrice")
-        if not price:
-            return 0
-        expirations = tk.options
-        if not expirations:
-            return 0
+    symbol_map = {}
+    all_symbols = set()
 
-        today = date.today()
-        exp_dates = [datetime.strptime(e, "%Y-%m-%d").date() for e in expirations]
+    async def process_ticker(ticker):
+        try:
+            chains = await NestedOptionChain.get(session, ticker)
+            if not chains:
+                return
+            chain = chains[0]
+            price = await get_stock_price(session, ticker)
+            if price <= 0:
+                return
+            ticker_map = {}
+            for target_dte in DTE_TARGETS:
+                try:
+                    exp = find_closest_expiry(chain.expirations, target_dte)
+                    actual_dte = (exp.expiration_date - date.today()).days
+                    if abs(actual_dte - target_dte) > 14:
+                        continue
+                    strikes = exp.strikes
+                    if not strikes:
+                        continue
+                    atm = min(strikes, key=lambda s: abs(float(s.strike_price) - price))
+                    call_sym = atm.call_streamer_symbol
+                    put_sym = atm.put_streamer_symbol
+                    ticker_map[target_dte] = (call_sym, put_sym)
+                    all_symbols.add(call_sym)
+                    all_symbols.add(put_sym)
+                except Exception:
+                    continue
+            if ticker_map:
+                symbol_map[ticker] = ticker_map
+        except Exception as e:
+            log.debug(f"IV chain error for {ticker}: {e}")
 
+    for i in range(0, len(universe), SCAN_BATCH_SIZE):
+        batch = universe[i : i + SCAN_BATCH_SIZE]
+        await asyncio.gather(*[process_ticker(t) for t in batch])
+        if (i + SCAN_BATCH_SIZE) % 100 < SCAN_BATCH_SIZE:
+            log.info(f"Gathered IV symbols: {min(i + SCAN_BATCH_SIZE, len(universe))}/{len(universe)}")
+
+    log.info(f"Gathered {len(all_symbols)} streamer symbols for {len(symbol_map)} tickers")
+    return symbol_map, all_symbols
+
+
+async def get_iv_signals_tt(session, universe):
+    """Get IV signals using TT Greeks streaming.
+
+    Opens a single DXLinkStreamer, subscribes to Greeks for all ATM options,
+    then compares call IV vs put IV at each DTE to vote on direction.
+    """
+    symbol_map, all_symbols = await gather_iv_symbols(session, universe)
+    if not all_symbols:
+        return {}
+
+    iv_data = {}  # {streamer_symbol: volatility}
+
+    async with DXLinkStreamer(session) as streamer:
+        await streamer.subscribe(Greeks, list(all_symbols))
+
+        expected = len(all_symbols)
+
+        async def collect_greeks():
+            async for greeks in streamer.listen(Greeks):
+                if greeks.volatility is not None:
+                    iv_data[greeks.event_symbol] = float(greeks.volatility)
+                if len(iv_data) >= expected:
+                    return
+
+        try:
+            await asyncio.wait_for(collect_greeks(), timeout=30.0)
+        except asyncio.TimeoutError:
+            log.info(f"Greeks timeout: got {len(iv_data)}/{expected} symbols")
+
+    signals = {}
+    for ticker, dte_map in symbol_map.items():
         votes = []
-        for target_dte in DTE_TARGETS:
-            target_date = today + timedelta(days=target_dte)
-            closest = min(exp_dates, key=lambda d: abs((d - target_date).days))
-            if abs((closest - target_date).days) > 14:
+        for _dte, (call_sym, put_sym) in dte_map.items():
+            call_iv = iv_data.get(call_sym)
+            put_iv = iv_data.get(put_sym)
+            if call_iv is None or put_iv is None:
                 continue
-            exp_str = closest.strftime("%Y-%m-%d")
-            chain = tk.option_chain(exp_str)
-
-            # find ATM strike
-            all_strikes = sorted(set(chain.calls["strike"].tolist()))
-            atm_strike = min(all_strikes, key=lambda s: abs(s - price))
-
-            call_row = chain.calls[chain.calls["strike"] == atm_strike]
-            put_row = chain.puts[chain.puts["strike"] == atm_strike]
-
-            if call_row.empty or put_row.empty:
-                continue
-
-            call_iv = call_row["impliedVolatility"].iloc[0]
-            put_iv = put_row["impliedVolatility"].iloc[0]
-
             if call_iv > put_iv:
                 votes.append(1)
             elif call_iv < put_iv:
                 votes.append(-1)
             else:
                 votes.append(0)
-
         if len(votes) < 2:
-            return 0
+            continue
         if all(v == 1 for v in votes):
-            return 1
-        if all(v == -1 for v in votes):
-            return -1
-        return 0
+            signals[ticker] = 1
+        elif all(v == -1 for v in votes):
+            signals[ticker] = -1
 
-    except Exception as e:
-        log.debug(f"IV signal error for {ticker}: {e}")
-        return 0
+    long_count = sum(1 for v in signals.values() if v == 1)
+    short_count = sum(1 for v in signals.values() if v == -1)
+    log.info(f"IV signals: {long_count} long, {short_count} short")
+    return signals
 
 
 def get_momentum_signal(ticker, lookback=252, skip=21):
@@ -256,13 +461,10 @@ def get_momentum_signal(ticker, lookback=252, skip=21):
         return 0
 
 
-def generate_signals(universe):
+async def generate_signals(session, universe):
     longs, shorts = [], []
-    total = len(universe)
-    for i, ticker in enumerate(universe):
-        if (i + 1) % 50 == 0:
-            log.info(f"Scanning signals: {i + 1}/{total}")
-        iv = get_iv_signal_yf(ticker)
+    iv_signals = await get_iv_signals_tt(session, universe)
+    for ticker, iv in iv_signals.items():
         if iv == 0:
             continue
         mom = get_momentum_signal(ticker)
@@ -273,10 +475,11 @@ def generate_signals(universe):
             shorts.append(ticker)
             log.info(f"  SHORT signal: {ticker} (iv={iv}, mom={mom})")
     log.info(f"Signals complete: {len(longs)} long, {len(shorts)} short")
-    return longs[:MAX_POSITIONS // 2], shorts[:MAX_POSITIONS // 2]
+    return longs[: MAX_POSITIONS // 2], shorts[: MAX_POSITIONS // 2]
 
 
 # --- Execution ---
+
 
 def find_closest_expiry(expirations, target_dte):
     today = date.today()
@@ -321,56 +524,6 @@ async def get_spread_mid_price(session, buy_sym, sell_sym):
     return None
 
 
-async def close_all_positions(session, account):
-    open_pos = get_open_positions()
-    if not open_pos:
-        log.info("No open positions to close")
-        return
-
-    for pos in open_pos:
-        buy_sym, sell_sym = pos["long_symbol"], pos["short_symbol"]
-        exit_credit = await get_spread_mid_price(session, buy_sym, sell_sym)
-        exit_val = float(exit_credit) if exit_credit else None
-
-        if not PAPER_MODE:
-            broker_positions = await account.get_positions(
-                session, instrument_type=InstrumentType.EQUITY_OPTION
-            )
-            broker_syms = {p.symbol: p for p in broker_positions if p.quantity != 0}
-
-            legs = []
-            for sym, action in [
-                (buy_sym, OrderAction.SELL_TO_CLOSE),
-                (sell_sym, OrderAction.BUY_TO_CLOSE),
-            ]:
-                if sym in broker_syms:
-                    legs.append(Leg(
-                        instrument_type=InstrumentType.EQUITY_OPTION,
-                        symbol=sym,
-                        action=action,
-                        quantity=pos["quantity"],
-                    ))
-
-            if legs:
-                order = NewOrder(
-                    time_in_force=OrderTimeInForce.DAY,
-                    order_type=OrderType.MARKET,
-                    legs=legs,
-                )
-                try:
-                    resp = await account.place_order(session, order, dry_run=DRY_RUN)
-                    log.info(f"{'[DRY] ' if DRY_RUN else ''}Closed {pos['ticker']} {pos['direction']}: {resp}")
-                except Exception as e:
-                    log.error(f"Failed to close {pos['ticker']}: {e}")
-
-        tag = "[PAPER] " if PAPER_MODE else ""
-        log.info(
-            f"{tag}Closed {pos['ticker']} {pos['direction']}: "
-            f"entry={pos['entry_debit']} exit={exit_val}"
-        )
-        mark_position_closed(pos["id"], exit_credit=exit_val)
-
-
 async def get_stock_price(session, ticker):
     """Get current stock price via tastytrade market data, yfinance fallback."""
     try:
@@ -386,33 +539,113 @@ async def get_stock_price(session, ticker):
         return 0.0
 
 
+async def close_single_position(session, account, pos):
+    """Close a single position via broker. Returns exit_credit float or None."""
+    buy_sym, sell_sym = pos["long_symbol"], pos["short_symbol"]
+    exit_credit = await get_spread_mid_price(session, buy_sym, sell_sym)
+    exit_val = float(exit_credit) if exit_credit else None
+
+    if not PAPER_MODE:
+        broker_positions = await account.get_positions(
+            session, instrument_type=InstrumentType.EQUITY_OPTION
+        )
+        broker_syms = {p.symbol: p for p in broker_positions if p.quantity != 0}
+
+        legs = []
+        for sym, action in [
+            (buy_sym, OrderAction.SELL_TO_CLOSE),
+            (sell_sym, OrderAction.BUY_TO_CLOSE),
+        ]:
+            if sym in broker_syms:
+                legs.append(Leg(
+                    instrument_type=InstrumentType.EQUITY_OPTION,
+                    symbol=sym,
+                    action=action,
+                    quantity=pos["quantity"],
+                ))
+
+        if legs:
+            order = NewOrder(
+                time_in_force=OrderTimeInForce.DAY,
+                order_type=OrderType.MARKET,
+                legs=legs,
+            )
+            try:
+                resp = await account.place_order(session, order, dry_run=DRY_RUN)
+                log.info(f"{'[DRY] ' if DRY_RUN else ''}Closed {pos['ticker']} {pos['direction']}: {resp}")
+            except Exception as e:
+                log.error(f"Failed to close {pos['ticker']}: {e}")
+
+    tag = "[PAPER] " if PAPER_MODE else ""
+    log.info(
+        f"{tag}Closed {pos['ticker']} {pos['direction']}: "
+        f"entry={pos['entry_debit']} exit={exit_val}"
+    )
+    return exit_val
+
+
+async def execute_close_phase(session, account, rb_id):
+    """Execute all pending close items for a rebalance."""
+    items = get_rebalance_items(rb_id, operation="CLOSE", status="PENDING")
+    if not items:
+        log.info("No pending close items")
+        return
+
+    for item in items:
+        con = get_db()
+        pos_row = con.execute(
+            "SELECT * FROM positions WHERE id = ?", (item["position_id"],)
+        ).fetchone()
+        con.close()
+        if not pos_row:
+            log.warning(f"Position {item['position_id']} not found for close item {item['id']}")
+            continue
+        pos = dict(pos_row)
+
+        exit_val = await close_single_position(session, account, pos)
+
+        # atomically update position + rebalance item
+        con = get_db()
+        try:
+            mark_position_closed(pos["id"], exit_credit=exit_val, con=con)
+            now = datetime.now(timezone.utc).isoformat()
+            con.execute(
+                "UPDATE rebalance_items SET status = 'COMPLETED', updated_at = ? WHERE id = ?",
+                (now, item["id"]),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+
 async def open_vertical_spread(session, account, ticker, direction):
+    """Build and place a vertical spread. Returns position data dict or None."""
     try:
         chains = await NestedOptionChain.get(session, ticker)
         if not chains:
             log.warning(f"No option chain for {ticker}")
-            return
+            return None
 
         chain = chains[0]
         exp = find_closest_expiry(chain.expirations, EXECUTION_DTE)
         strikes = exp.strikes
         if not strikes:
-            return
+            return None
 
         price = await get_stock_price(session, ticker)
         if price <= 0:
-            return
+            return None
 
         atm_strike, otm_strike = pick_spread_strikes(strikes, price, direction)
         if atm_strike is None:
             log.warning(f"Could not find spread strikes for {ticker}")
-            return
+            return None
 
         strike_map = {s.strike_price: s for s in strikes}
         atm_s = strike_map.get(atm_strike)
         otm_s = strike_map.get(otm_strike)
         if not atm_s or not otm_s:
-            return
+            return None
 
         if direction == "long":
             buy_sym = atm_s.call
@@ -427,14 +660,17 @@ async def open_vertical_spread(session, account, ticker, direction):
         if PAPER_MODE:
             if entry is None:
                 log.warning(f"No mid-price for {ticker}, skipping paper fill")
-                return
-            record_position(ticker, direction, buy_sym, sell_sym, CONTRACTS_PER_TRADE, entry_debit=entry)
+                return None
             log.info(
                 f"[PAPER] Filled {direction} spread on {ticker}: "
                 f"{buy_sym}/{sell_sym} @ {exp.expiration_date} "
                 f"strikes {atm_strike}/{otm_strike} debit={entry:.4f}"
             )
-            return
+            return {
+                "ticker": ticker, "direction": direction,
+                "buy_sym": buy_sym, "sell_sym": sell_sym,
+                "qty": CONTRACTS_PER_TRADE, "entry_debit": entry,
+            }
 
         legs = [
             Leg(
@@ -472,18 +708,61 @@ async def open_vertical_spread(session, account, ticker, direction):
             f"{buy_sym}/{sell_sym} @ {exp.expiration_date} "
             f"strikes {atm_strike}/{otm_strike}"
         )
-        if not DRY_RUN:
-            record_position(ticker, direction, buy_sym, sell_sym, CONTRACTS_PER_TRADE, entry_debit=entry)
+        if DRY_RUN:
+            return None
+        return {
+            "ticker": ticker, "direction": direction,
+            "buy_sym": buy_sym, "sell_sym": sell_sym,
+            "qty": CONTRACTS_PER_TRADE, "entry_debit": entry,
+        }
 
     except Exception as e:
         log.error(f"Failed to open spread for {ticker}: {e}")
+        return None
+
+
+async def execute_open_phase(session, account, rb_id):
+    """Execute all pending open items for a rebalance."""
+    items = get_rebalance_items(rb_id, operation="OPEN", status="PENDING")
+    if not items:
+        log.info("No pending open items")
+        return
+
+    for item in items:
+        result = await open_vertical_spread(session, account, item["ticker"], item["direction"])
+
+        # atomically record position + update rebalance item
+        con = get_db()
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            if result:
+                pos_id = record_position(
+                    result["ticker"], result["direction"],
+                    result["buy_sym"], result["sell_sym"],
+                    result["qty"], entry_debit=result["entry_debit"],
+                    con=con,
+                )
+                con.execute(
+                    "UPDATE rebalance_items SET status = 'COMPLETED', position_id = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (pos_id, now, item["id"]),
+                )
+            else:
+                con.execute(
+                    "UPDATE rebalance_items SET status = 'FAILED', updated_at = ? WHERE id = ?",
+                    (now, item["id"]),
+                )
+            con.commit()
+        finally:
+            con.close()
 
 
 # --- P&L Tracking ---
 
+
 def compute_monthly_pnl():
     """Compute and store P&L for positions closed this month."""
-    con = sqlite3.connect(DB_PATH)
+    con = get_db()
     today = date.today()
     month_str = today.strftime("%Y-%m")
     first_of_month = today.replace(day=1).isoformat()
@@ -499,7 +778,8 @@ def compute_monthly_pnl():
 
     gross_pnl = 0.0
     total_comms = 0.0
-    for entry_debit, exit_credit, comms, qty in rows:
+    for r in rows:
+        entry_debit, exit_credit, comms, qty = r["entry_debit"], r["exit_credit"], r["commissions"], r["quantity"]
         if entry_debit is not None and exit_credit is not None:
             # P&L = (exit - entry) * 100 * qty for options
             gross_pnl += (exit_credit - entry_debit) * 100 * qty
@@ -511,7 +791,7 @@ def compute_monthly_pnl():
     prev = con.execute(
         "SELECT cumulative_pnl FROM monthly_pnl ORDER BY month DESC LIMIT 1"
     ).fetchone()
-    cum = (prev[0] if prev else 0.0) + net_pnl
+    cum = (prev["cumulative_pnl"] if prev else 0.0) + net_pnl
 
     con.execute(
         "INSERT OR REPLACE INTO monthly_pnl (month, gross_pnl, commissions, net_pnl, num_trades, cumulative_pnl) VALUES (?,?,?,?,?,?)",
@@ -528,7 +808,7 @@ def compute_monthly_pnl():
 
 def print_paper_summary():
     """Print full walk-forward results."""
-    con = sqlite3.connect(DB_PATH)
+    con = get_db()
     rows = con.execute("SELECT * FROM monthly_pnl ORDER BY month").fetchall()
     con.close()
     if not rows:
@@ -538,12 +818,15 @@ def print_paper_summary():
     log.info(f"{'Month':<10} {'Gross':>10} {'Comms':>10} {'Net':>10} {'Trades':>7} {'Cumulative':>12}")
     log.info("-" * 70)
     for row in rows:
-        _, month, gross, comms, net, trades, cum = row
-        log.info(f"{month:<10} {gross:>+10.2f} {comms:>10.2f} {net:>+10.2f} {trades:>7} {cum:>+12.2f}")
+        log.info(
+            f"{row['month']:<10} {row['gross_pnl']:>+10.2f} {row['commissions']:>10.2f} "
+            f"{row['net_pnl']:>+10.2f} {row['num_trades']:>7} {row['cumulative_pnl']:>+12.2f}"
+        )
     log.info("=" * 70)
 
 
 # --- Rebalance Logic ---
+
 
 def is_rebalance_window():
     today = date.today()
@@ -559,7 +842,59 @@ def is_rebalance_window():
     return REBALANCE_DAY_RANGE[0] <= bday_count <= REBALANCE_DAY_RANGE[1]
 
 
+async def _get_account(session):
+    if TT_ACCOUNT:
+        return await Account.get(session, TT_ACCOUNT)
+    accounts = await Account.get(session)
+    if not accounts:
+        raise RuntimeError("No tastytrade accounts found")
+    return accounts[0]
+
+
+async def resume_rebalance(rb, session, account):
+    """Resume an interrupted rebalance from its current status."""
+    rb_id = rb["id"]
+    status = rb["status"]
+    log.info(f"Resuming rebalance {rb_id} from status={status}")
+
+    if status == "PENDING":
+        close_items = get_rebalance_items(rb_id, operation="CLOSE")
+        if close_items:
+            update_rebalance_status(rb_id, "CLOSING")
+            await execute_close_phase(session, account, rb_id)
+            if PAPER_MODE:
+                compute_monthly_pnl()
+        update_rebalance_status(rb_id, "OPENING")
+        await execute_open_phase(session, account, rb_id)
+    elif status == "CLOSING":
+        await execute_close_phase(session, account, rb_id)
+        if PAPER_MODE:
+            compute_monthly_pnl()
+        update_rebalance_status(rb_id, "OPENING")
+        await execute_open_phase(session, account, rb_id)
+    elif status == "OPENING":
+        await execute_open_phase(session, account, rb_id)
+
+    update_rebalance_status(rb_id, "COMPLETED")
+
+    if PAPER_MODE:
+        print_paper_summary()
+    log.info(f"=== Resumed rebalance {rb_id} COMPLETE ===")
+
+
 async def rebalance():
+    # 1. check for interrupted rebalance
+    pending = get_pending_rebalance()
+    if pending:
+        log.info(f"Found interrupted rebalance {pending['id']} (status={pending['status']})")
+        session = Session()
+        async with session:
+            account = await _get_account(session)
+            log.info(f"Using account {account.account_number} (paper={PAPER_MODE}, dry_run={DRY_RUN})")
+            await resume_rebalance(pending, session, account)
+        return
+
+    # 2. check if already done or not in window
     if was_rebalanced_this_month():
         log.info("Already rebalanced this month, skipping")
         return
@@ -570,43 +905,42 @@ async def rebalance():
     tag = "[PAPER] " if PAPER_MODE else ""
     log.info(f"=== {tag}REBALANCE START ===")
 
-    # 1. get universe
+    # 3. get universe
     tickers = get_sp500_tickers()
 
-    # 2. connect to tastytrade
+    # 4. connect to tastytrade
     session = Session()
     async with session:
-        if TT_ACCOUNT:
-            account = await Account.get(session, TT_ACCOUNT)
-        else:
-            accounts = await Account.get(session)
-            if not accounts:
-                log.error("No tastytrade accounts found")
-                return
-            account = accounts[0]
+        account = await _get_account(session)
         log.info(f"Using account {account.account_number} (paper={PAPER_MODE}, dry_run={DRY_RUN})")
 
-        # 3. filter dividend payers via tastytrade metrics
+        # 5. filter dividend payers
         universe = await filter_no_dividends_tt(session, tickers)
 
-        # 4. generate signals
-        longs, shorts = generate_signals(universe)
+        # 6. generate signals via TT Greeks
+        longs, shorts = await generate_signals(session, universe)
         log.info(f"Final targets: LONG {longs}, SHORT {shorts}")
 
-        # 5. close existing positions (paper: mark-to-market at TT mid)
-        had_positions = bool(get_open_positions())
-        await close_all_positions(session, account)
+        # 7. plan the rebalance
+        open_positions = get_open_positions()
+        rb_id = create_rebalance_record(longs, shorts)
+        plan_close_items(rb_id, open_positions)
+        plan_open_items(rb_id, longs, shorts)
 
-        if PAPER_MODE and had_positions:
+        # 8. execute close phase
+        update_rebalance_status(rb_id, "CLOSING")
+        await execute_close_phase(session, account, rb_id)
+
+        # 9. compute P&L if paper mode
+        if PAPER_MODE and open_positions:
             compute_monthly_pnl()
 
-        # 6. open new positions (paper: record fill at TT mid)
-        for ticker in longs:
-            await open_vertical_spread(session, account, ticker, "long")
-        for ticker in shorts:
-            await open_vertical_spread(session, account, ticker, "short")
+        # 10. execute open phase
+        update_rebalance_status(rb_id, "OPENING")
+        await execute_open_phase(session, account, rb_id)
 
-        record_rebalance(longs, shorts)
+        # 11. mark completed
+        update_rebalance_status(rb_id, "COMPLETED")
 
         if PAPER_MODE:
             print_paper_summary()
@@ -615,6 +949,7 @@ async def rebalance():
 
 
 # --- Main Loop ---
+
 
 async def main_loop():
     init_db()
